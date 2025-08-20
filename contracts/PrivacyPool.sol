@@ -72,6 +72,7 @@ contract PrivacyPool {
     // Offer state
     mapping(uint256 => Offer) public offers; // secretHash => Offer
     mapping(bytes32 => Transaction) public transactions; // transactionId => Transaction
+    mapping(string => bytes32) public titleToTransactionId; // randomTitle => transactionId
 
     // Events
     event Deposit(
@@ -103,6 +104,12 @@ contract PrivacyPool {
         uint256 cryptoAmount,
         uint256 fiatAmount,
         string title
+    );
+
+    event TransactionVerified(
+        bytes32 indexed transactionId,
+        string comment,
+        uint256 finalFiatAmount
     );
 
     // Errors
@@ -311,6 +318,9 @@ contract PrivacyPool {
             timestamp: block.timestamp
         });
 
+        // Map title to transaction ID for lookup
+        titleToTransactionId[title] = transactionId;
+
         emit TransactionCreated(
             transactionId,
             offerSecretHash,
@@ -326,22 +336,62 @@ contract PrivacyPool {
     function verifyTransaction(
         bytes calldata proofTransaction,
         bytes32[] calldata publicInputsTransaction,
-        bytes calldata proofPrice, // For static offers, proofPrice and publicInputsPrice can be empty
+        bytes calldata proofPrice,
         bytes32[] calldata publicInputsPrice,
         address tlsnTransactionVerifier,
+        uint8 amountLength,
+        uint8 revTagLength,
         uint256 secretNullifierHash
     ) external {
-        // Verify proof
+        // Verify TLSN proof for transaction
         IVerifier honkVerifier = IVerifier(tlsnTransactionVerifier);
         if (!honkVerifier.verify(proofTransaction, publicInputsTransaction)) {
-            revert("Invalid proof");
+            revert("Invalid transaction proof");
         }
 
-        // Verify proof
-        IVerifier honkBinanceVerifier = IVerifier(tlsnBinanceVerifier);
-        if (!honkBinanceVerifier.verify(proofPrice, publicInputsPrice)) {
-            revert("Invalid proof");
+        // Extract comment from public inputs
+        string memory commentData = _extractCommentFromPublicInputs(
+            publicInputsTransaction
+        );
+
+        // Find transaction by comment (randomTitle)
+        bytes32 transactionId = titleToTransactionId[commentData];
+        require(
+            transactionId != bytes32(0),
+            "Transaction not found for comment"
+        );
+
+        // Verify transaction exists and is pending
+        Transaction storage txn = transactions[transactionId];
+        require(txn.timestamp != 0, "Transaction not found");
+        require(
+            keccak256(bytes(txn.status)) == keccak256(bytes("pending")),
+            "Transaction not pending"
+        );
+        require(block.timestamp <= txn.expiresAt, "Transaction expired");
+
+        // For dynamic offers, verify price proof and calculate fiat amount
+        if (keccak256(bytes(txn.offerType)) == keccak256(bytes("dynamic"))) {
+            require(
+                proofPrice.length > 0,
+                "Price proof required for dynamic offers"
+            );
+
+            IVerifier honkBinanceVerifier = IVerifier(tlsnBinanceVerifier);
+            if (!honkBinanceVerifier.verify(proofPrice, publicInputsPrice)) {
+                revert("Invalid price proof");
+            }
+
+            // Extract and update fiat amount from price proof
+            uint256 fiatAmount = _extractFiatAmountFromPriceProof(
+                publicInputsPrice,
+                txn.cryptoAmount
+            );
+            txn.fiatAmount = fiatAmount;
         }
+
+        // Mark transaction as successful
+        txn.status = "success";
     }
 
     // Internal Functions
@@ -351,6 +401,76 @@ contract PrivacyPool {
     ) internal pure returns (uint256) {
         uint256[2] memory inputs = [a, b];
         return PoseidonT3.hash(inputs);
+    }
+
+    function _extractCommentFromPublicInputs(
+        bytes32[] calldata publicInputs
+    ) internal pure returns (string memory) {
+        bytes memory commentData = new bytes(23);
+
+        // Comment data starts at index 35
+        for (uint256 i = 0; i < 23; i++) {
+            commentData[i] = bytes1(uint8(uint256(publicInputs[35 + i])));
+        }
+
+        string memory fullComment = string(commentData);
+
+        // Parse JSON format: "comment":"value"
+        bytes memory commentBytes = bytes(fullComment);
+        bytes memory jsonPrefix = bytes('"comment":"');
+
+        if (commentBytes.length >= jsonPrefix.length + 1) {
+            // Check if starts with "comment":"
+            bool hasJsonPrefix = true;
+            for (uint256 i = 0; i < jsonPrefix.length; i++) {
+                if (commentBytes[i] != jsonPrefix[i]) {
+                    hasJsonPrefix = false;
+                    break;
+                }
+            }
+
+            if (hasJsonPrefix) {
+                // Find the ending quote
+                uint256 startPos = jsonPrefix.length;
+                uint256 endPos = commentBytes.length;
+
+                // Look for ending quote
+                for (uint256 i = startPos; i < commentBytes.length; i++) {
+                    if (commentBytes[i] == '"') {
+                        endPos = i;
+                        break;
+                    }
+                }
+
+                if (endPos > startPos) {
+                    // Extract value between quotes
+                    uint256 valueLength = endPos - startPos;
+                    bytes memory valueBytes = new bytes(valueLength);
+
+                    for (uint256 i = 0; i < valueLength; i++) {
+                        valueBytes[i] = commentBytes[startPos + i];
+                    }
+
+                    return string(valueBytes);
+                }
+            }
+        }
+
+        // If no JSON format found, return original string
+        return fullComment;
+    }
+
+    function _extractFiatAmountFromPriceProof(
+        bytes32[] calldata publicInputs,
+        uint256 cryptoAmount
+    ) internal pure returns (uint256) {
+        // Extract price from Binance proof and calculate fiat amount
+        // This needs to be implemented based on your price oracle public inputs structure
+        require(publicInputs.length > 0, "No price public inputs provided");
+
+        // Placeholder - extract price and calculate fiat amount
+        uint256 price = uint256(publicInputs[0]); // Assuming price is in first public input
+        return (cryptoAmount * price) / 1e18; // Adjust decimals as needed
     }
 
     // Internal paymoney functions

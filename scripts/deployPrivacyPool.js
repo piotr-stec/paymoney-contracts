@@ -21,7 +21,7 @@ async function main() {
   console.log(`MerkleTreeLib deployed to: ${merkleTreeLib.target}`);
 
   // Deploy HonkVerifier
-  console.log("Deploying HonkVerifier...");
+  console.log("Deploying HonkVerifier for withdraw...");
   const HonkVerifier = await hre.ethers.getContractFactory("HonkVerifier");
   const honkVerifier = await HonkVerifier.deploy();
   await honkVerifier.waitForDeployment();
@@ -52,7 +52,6 @@ async function main() {
   const privacyPool = await PrivacyPool.deploy(
     owner,
     verifier,
-    hre.ethers.ZeroAddress, // tlsnTransactionVerifier
     tlsnBinanceVerifier
   );
   await privacyPool.waitForDeployment();
