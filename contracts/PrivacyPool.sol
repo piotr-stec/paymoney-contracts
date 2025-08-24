@@ -34,6 +34,7 @@ struct Transaction {
     address tokenAddress;
     string revTag;
     uint256 timestamp;
+    uint256 offerSecretHash; // Reference to original offer
 }
 
 struct Offer {
@@ -109,7 +110,8 @@ contract PrivacyPool {
     event TransactionVerified(
         bytes32 indexed transactionId,
         string comment,
-        uint256 finalFiatAmount
+        uint256 finalFiatAmount,
+        uint256 cryptoToSend
     );
 
     // Errors
@@ -315,7 +317,8 @@ contract PrivacyPool {
             randomTitle: title,
             tokenAddress: offer.tokenAddress,
             revTag: offer.revTag,
-            timestamp: block.timestamp
+            timestamp: block.timestamp,
+            offerSecretHash: offerSecretHash
         });
 
         // Map title to transaction ID for lookup
@@ -343,25 +346,93 @@ contract PrivacyPool {
         uint8 revTagLength,
         uint256 secretNullifierHash
     ) external {
+        // Step 1: Verify TLSN proof and find transaction ID
+        bytes32 transactionId = _verifyProofAndFindTransaction(
+            proofTransaction,
+            publicInputsTransaction,
+            tlsnTransactionVerifier
+        );
+
+        // // Step 2: Validate transaction and extract data
+        _validateTransactionAndExtractData(
+            publicInputsTransaction,
+            transactionId,
+            amountLength,
+            revTagLength
+        );
+
+        // Step 3: Handle offer type specific processing
+        Transaction storage txn = transactions[transactionId];
+
+        uint256 cryptoAmountToSend;
+
+        if (keccak256(bytes(txn.offerType)) == keccak256(bytes("dynamic"))) {
+            cryptoAmountToSend = _processDynamicOffer(
+                proofPrice,
+                publicInputsPrice,
+                transactionId
+            );
+        } else {
+            cryptoAmountToSend = _processStaticOffer(transactionId);
+        }
+
+        // Mark transaction as successful
+        txn.status = "success";
+        emit TransactionVerified(
+            transactionId,
+            "",
+            txn.fiatAmount,
+            cryptoAmountToSend
+        );
+
+        uint256 secretNullifierAmountHash = _poseidonHash(
+            secretNullifierHash,
+            cryptoAmountToSend
+        );
+        uint256 commitment = _poseidonHash(
+            secretNullifierAmountHash,
+            uint256(uint160(txn.tokenAddress))
+        );
+
+        // Add to merkle tree
+        tree.addLeaf(commitment);
+        emit Deposit(secretNullifierHash, cryptoAmountToSend, txn.tokenAddress);
+    }
+
+    function _verifyProofAndFindTransaction(
+        bytes calldata proofTransaction,
+        bytes32[] calldata publicInputsTransaction,
+        address tlsnTransactionVerifier
+    ) internal view returns (bytes32) {
         // Verify TLSN proof for transaction
-        IVerifier honkVerifier = IVerifier(tlsnTransactionVerifier);
-        if (!honkVerifier.verify(proofTransaction, publicInputsTransaction)) {
+        if (
+            !IVerifier(tlsnTransactionVerifier).verify(
+                proofTransaction,
+                publicInputsTransaction
+            )
+        ) {
             revert("Invalid transaction proof");
         }
 
-        // Extract comment from public inputs
+        // Extract comment and find transaction
         string memory commentData = _extractCommentFromPublicInputs(
             publicInputsTransaction
         );
-
-        // Find transaction by comment (randomTitle)
         bytes32 transactionId = titleToTransactionId[commentData];
         require(
             transactionId != bytes32(0),
             "Transaction not found for comment"
         );
 
-        // Verify transaction exists and is pending
+        return transactionId;
+    }
+
+    function _validateTransactionAndExtractData(
+        bytes32[] calldata publicInputsTransaction,
+        bytes32 transactionId,
+        uint8 amountLength,
+        uint8 revTagLength
+    ) internal {
         Transaction storage txn = transactions[transactionId];
         require(txn.timestamp != 0, "Transaction not found");
         require(
@@ -370,28 +441,94 @@ contract PrivacyPool {
         );
         require(block.timestamp <= txn.expiresAt, "Transaction expired");
 
-        // For dynamic offers, verify price proof and calculate fiat amount
-        if (keccak256(bytes(txn.offerType)) == keccak256(bytes("dynamic"))) {
-            require(
-                proofPrice.length > 0,
-                "Price proof required for dynamic offers"
-            );
+        // Extract and validate data
+        uint256 fiatAmountTransferred = _extractFiatAmount(
+            publicInputsTransaction,
+            amountLength
+        );
+        string memory extractedRevTag = _extractRevTag(
+            publicInputsTransaction,
+            revTagLength
+        );
 
-            IVerifier honkBinanceVerifier = IVerifier(tlsnBinanceVerifier);
-            if (!honkBinanceVerifier.verify(proofPrice, publicInputsPrice)) {
-                revert("Invalid price proof");
-            }
+        require(
+            keccak256(bytes(extractedRevTag)) == keccak256(bytes(txn.revTag)),
+            "RevTag mismatch"
+        );
 
-            // Extract and update fiat amount from price proof
-            uint256 fiatAmount = _extractFiatAmountFromPriceProof(
-                publicInputsPrice,
-                txn.cryptoAmount
-            );
-            txn.fiatAmount = fiatAmount;
+        // Update transaction with actual transferred amount
+        txn.fiatAmount = fiatAmountTransferred;
+    }
+
+    function _processDynamicOffer(
+        bytes calldata proofPrice,
+        bytes32[] calldata publicInputsPrice,
+        bytes32 transactionId
+    ) internal view returns (uint256) {
+        require(
+            proofPrice.length > 0,
+            "Price proof required for dynamic offers"
+        );
+
+        if (
+            !IVerifier(tlsnBinanceVerifier).verify(
+                proofPrice,
+                publicInputsPrice
+            )
+        ) {
+            revert("Invalid price proof");
         }
 
-        // Mark transaction as successful
-        txn.status = "success";
+        // Extract exchange rate from price proof
+        uint256 exchangeRate = extractCleanPrice(publicInputsPrice);
+
+        // For dynamic offers, the fiat amount was already set from extracted transaction data
+        // We validate that the price proof is legitimate
+        require(exchangeRate > 0, "Invalid exchange rate");
+
+        Transaction storage txn = transactions[transactionId];
+
+        // Calculate how much crypto to send based on fiat amount transferred and exchange rate
+        // Formula: cryptoAmount = fiatAmount / exchangeRate
+        // Example: 2 PLN (cents) / 362596667 (rate with 8 decimals) = crypto amount
+
+        uint256 cryptoAmountToSend = calculateCryptoForDeposit(
+            txn.fiatAmount, // Fiat amount transferred (e.g., 2 for 0.02 PLN)
+            2, // Fiat decimals (PLN cents = 2 decimals)
+            exchangeRate, // Exchange rate from Binance (8 decimals)
+            6 // Crypto decimals
+        );
+
+        return cryptoAmountToSend;
+    }
+
+    function _processStaticOffer(
+        bytes32 transactionId
+    ) internal view returns (uint256) {
+        Transaction storage txn = transactions[transactionId];
+
+        require(txn.fiatAmount > 0, "Invalid fiat amount for static offer");
+
+        // Get the original offer using stored reference
+        Offer storage offer = offers[txn.offerSecretHash];
+        require(offer.fiatAmount > 0, "Invalid offer fiat amount");
+        require(offer.cryptoAmount > 0, "Invalid offer crypto amount");
+
+        // Calculate proportional crypto amount for static offers
+        // Formula: cryptoToSend = (fiatTransferred / totalFiatPrice) * totalCryptoAmount
+        // Example: If offer is 100 crypto for 1000 fiat, and user sent 500 fiat
+        // Then: cryptoToSend = (500 / 1000) * 100 = 50 crypto
+
+        uint256 cryptoAmountToSend = (txn.fiatAmount * offer.cryptoAmount) /
+            offer.fiatAmount;
+
+        // Ensure we don't send more crypto than available in the offer
+        require(
+            cryptoAmountToSend <= offer.cryptoAmount,
+            "Exceeds available crypto in offer"
+        );
+
+        return cryptoAmountToSend;
     }
 
     // Internal Functions
@@ -460,17 +597,133 @@ contract PrivacyPool {
         return fullComment;
     }
 
-    function _extractFiatAmountFromPriceProof(
+    function _extractFiatAmount(
         bytes32[] calldata publicInputs,
-        uint256 cryptoAmount
+        uint8 amountLength
     ) internal pure returns (uint256) {
-        // Extract price from Binance proof and calculate fiat amount
-        // This needs to be implemented based on your price oracle public inputs structure
-        require(publicInputs.length > 0, "No price public inputs provided");
+        // Amount format: "amount":-2
+        // Starts at index 76, extract the numeric value after the minus sign
+        uint256 startIndex = 76 + 10; // "amount":- = 10 characters
 
-        // Placeholder - extract price and calculate fiat amount
-        uint256 price = uint256(publicInputs[0]); // Assuming price is in first public input
-        return (cryptoAmount * price) / 1e18; // Adjust decimals as needed
+        bytes memory amountBytes = new bytes(amountLength);
+        for (uint256 i = 0; i < amountLength; i++) {
+            amountBytes[i] = bytes1(
+                uint8(uint256(publicInputs[startIndex + i]))
+            );
+        }
+
+        // Convert bytes to number
+        uint256 result = 0;
+        for (uint256 i = 0; i < amountLength; i++) {
+            uint8 digit = uint8(amountBytes[i]);
+            if (digit >= 0x30 && digit <= 0x39) {
+                // '0'-'9'
+                result = result * 10 + (digit - 0x30);
+            }
+        }
+
+        return result;
+    }
+
+    function _extractRevTag(
+        bytes32[] calldata publicInputs,
+        uint8 revTagLength
+    ) internal pure returns (string memory) {
+        // Username format: "username":"value"
+        // Starts at index 105, extract the value between quotes
+        uint256 startIndex = 105 + 12; // "username":" = 12 characters
+
+        // Calculate actual value length (excluding quotes and JSON formatting)
+        // revTagLength is total length (23), minus "username":"" (13 chars), minus closing quote (1 char) = 9 chars
+        uint256 valueLength = revTagLength - 13; // Remove "username":" and closing "
+
+        bytes memory revTagBytes = new bytes(valueLength);
+        for (uint256 i = 0; i < valueLength; i++) {
+            revTagBytes[i] = bytes1(
+                uint8(uint256(publicInputs[startIndex + i]))
+            );
+        }
+
+        return string(revTagBytes);
+    }
+
+    // Extract clean price value from Binance API format: "price":"3.62596667"
+    // Binance always returns exactly 8 decimal places
+    function extractCleanPrice(
+        bytes32[] calldata publicInputs
+    ) internal pure returns (uint256) {
+        // Extract raw price data
+        bytes memory priceData = new bytes(20);
+        for (uint256 i = 0; i < 20; i++) {
+            priceData[i] = bytes1(uint8(uint256(publicInputs[70 + i])));
+        }
+
+        // Find the numeric value between quotes after ":"
+        // Format: "price":"3.62596667"
+        uint256 start = 0;
+        uint256 end = 0;
+        bool foundColon = false;
+        bool foundSecondQuote = false;
+
+        for (uint256 i = 0; i < 20; i++) {
+            if (priceData[i] == 0x3A) {
+                // ':'
+                foundColon = true;
+            } else if (foundColon && priceData[i] == 0x22) {
+                // '"' after colon
+                if (!foundSecondQuote) {
+                    start = i + 1; // Start after the quote
+                    foundSecondQuote = true;
+                } else {
+                    end = i; // End at the closing quote
+                    break;
+                }
+            }
+        }
+
+        // Parse decimal number - Binance always has exactly 8 decimal places
+        uint256 result = 0;
+        bool foundDot = false;
+
+        for (uint256 i = start; i < end; i++) {
+            uint8 char = uint8(priceData[i]);
+            if (char == 0x2E) {
+                // '.'
+                foundDot = true;
+            } else if (char >= 0x30 && char <= 0x39) {
+                // '0'-'9'
+                result = result * 10 + (char - 0x30);
+            }
+        }
+
+        // Result is already in the correct format (8 decimal places)
+        // Example: "3.62596667" -> 362596667
+        return result;
+    }
+
+    function calculateCryptoForDeposit(
+        uint256 fiatAmount, // Fiat amount deposited
+        uint8 fiatDecimals, // Fiat token decimals (e.g., 2 for PLN cents)
+        uint256 exchangeRate, // Exchange rate (crypto/fiat) with 8 decimals from Binance
+        uint8 cryptoDecimals // Crypto token decimals (e.g., 6 for USDC, 18 for ETH)
+    ) public pure returns (uint256) {
+        // Formula: crypto_amount = fiat_amount / exchange_rate
+
+        // Step 1: Normalize fiat amount to match rate precision (8 decimals)
+        uint256 fiatWith8Decimals = fiatAmount * (10 ** (8 - fiatDecimals));
+
+        // Step 2: Calculate crypto amount with 8 decimal precision
+        uint256 cryptoWith8Decimals = (fiatWith8Decimals * 10 ** 8) /
+            exchangeRate;
+
+        // Step 3: Convert to target crypto token decimals
+        if (cryptoDecimals >= 8) {
+            // Scale up (e.g., for ETH with 18 decimals)
+            return cryptoWith8Decimals * (10 ** (cryptoDecimals - 8));
+        } else {
+            // Scale down (e.g., for USDC with 6 decimals)
+            return cryptoWith8Decimals / (10 ** (8 - cryptoDecimals));
+        }
     }
 
     // Internal paymoney functions

@@ -10,7 +10,7 @@ async function main() {
     const testToken = await hre.ethers.getContractAt("MockERC20", TOKEN_ADDRESS);
 
     const balance = await testToken.balanceOf(PP_ADDRESS);
-    console.log("Current balance:", hre.ethers.formatEther(balance), "tokens");
+    console.log("Current balance:", hre.ethers.formatUnits(balance, 6), "tokens");
 
 
 }
