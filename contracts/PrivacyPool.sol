@@ -175,20 +175,11 @@ contract PrivacyPool {
         uint256 nullifier_1 = uint256(publicInputs[1]);
         address token_address_1 = address(uint160(uint256(publicInputs[2])));
         uint256 amount = uint256(publicInputs[3]);
-        uint256 root_2 = uint256(publicInputs[4]);
-        uint256 nullifier_2 = uint256(publicInputs[5]);
-        // unused for now
-        address token_address_2 = address(uint160(uint256(publicInputs[6])));
-        uint256 gas_fee = uint256(publicInputs[7]);
-        uint256 refund_commitment_hash = uint256(publicInputs[8]);
-        uint256 refund_commitment_hash_fee = uint256(publicInputs[9]);
-        address recipient = address(uint160(uint256(publicInputs[10])));
+        uint256 refund_commitment_hash = uint256(publicInputs[4]);
+        address recipient = address(uint160(uint256(publicInputs[5])));
 
         // Check if nullifiers already used
         if (nullifierHashes[nullifier_1]) {
-            revert NullifierAlreadyUsed();
-        }
-        if (nullifierHashes[nullifier_2]) {
             revert NullifierAlreadyUsed();
         }
 
@@ -196,17 +187,12 @@ contract PrivacyPool {
         if (!tree.isValidRoot(root_1)) {
             revert InvalidRoot();
         }
-        if (!tree.isValidRoot(root_2)) {
-            revert InvalidRoot();
-        }
 
         // Mark nullifiers as used
         nullifierHashes[nullifier_1] = true;
-        nullifierHashes[nullifier_2] = true;
 
         // Add refund commitments to tree
         tree.addLeaf(refund_commitment_hash);
-        tree.addLeaf(refund_commitment_hash_fee);
 
         // Transfer tokens to recipient
         IERC20 erc20_1 = IERC20(token_address_1);
