@@ -1,0 +1,13 @@
+_recipient = ""
+amount = ""
+commitment_amount_1 = ""
+hashpath_1 = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+index_1 = ""
+nullifier_1 = ""
+refund_amount_1 = ""
+refund_commitment_hash_1 = ""
+refund_nullifier_1 = ""
+refund_secret_1 = ""
+root_1 = ""
+secret_1 = ""
+token_address_1 = ""
