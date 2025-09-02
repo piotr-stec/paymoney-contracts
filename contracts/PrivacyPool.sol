@@ -23,18 +23,29 @@ struct OfferParams {
     string revTag;
 }
 
+enum TransactionStatus {
+    PENDING,
+    SUCCESS,
+    REJECTED
+}
+
 struct Transaction {
     uint256 cryptoAmount;
     uint256 fiatAmount; // 0 for dynamic transactions
     string offerType;
     string currency;
     uint256 expiresAt;
-    string status; // "pending", "success", "rejected"
+    TransactionStatus status;
     string randomTitle;
     address tokenAddress;
     string revTag;
     uint256 timestamp;
     uint256 offerSecretHash; // Reference to original offer
+}
+
+enum OfferStatus {
+    CREATED,
+    CANCELLED
 }
 
 struct Offer {
@@ -45,9 +56,10 @@ struct Offer {
     uint256 fiatAmount; // 0 for dynamic offers
     address tokenAddress;
     uint256 fee;
-    string status;
+    OfferStatus status;
     string revTag;
     uint256 timestamp;
+    uint256 cancelHash;
 }
 
 interface IVerifier {
@@ -74,6 +86,7 @@ contract PrivacyPool {
     mapping(uint256 => Offer) public offers; // secretHash => Offer
     mapping(bytes32 => Transaction) public transactions; // transactionId => Transaction
     mapping(string => bytes32) public titleToTransactionId; // randomTitle => transactionId
+    mapping(uint256 => bytes32[]) public offerTransactions; // offerSecretHash => transactionIds[]
 
     // Events
     event Deposit(
@@ -114,11 +127,13 @@ contract PrivacyPool {
         uint256 cryptoToSend
     );
 
+    event OfferCancelIntent(uint256 indexed offerSecretHash);
+    event OfferCancelClaim(uint256 indexed offerSecretHash);
+
     // Errors
     error TransferFailed();
     error NullifierAlreadyUsed();
     error InvalidRoot();
-    error UnsupportedVerificationKey();
     error OfferNotFound();
     error OfferAlreadyExists();
     error OfferNotActive();
@@ -242,6 +257,64 @@ contract PrivacyPool {
         );
     }
 
+    function cancelIntent(uint256 offerSecret, uint256 cancelHash) external {
+        uint256 offerSecretHash = _poseidonHash(offerSecret, offerSecret);
+        Offer storage offer = offers[offerSecretHash];
+        require(offer.status == OfferStatus.CREATED, "Offer not active");
+        offer.status = OfferStatus.CANCELLED;
+        offer.cancelHash = cancelHash;
+        emit OfferCancelIntent(offerSecretHash);
+    }
+
+    function cancelClaim(
+        uint256 offerHash,
+        uint256 cancelSecret,
+        uint256 secretNullifierHash
+    ) external {
+        uint256 offerCancelHash = _poseidonHash(cancelSecret, cancelSecret);
+        Offer memory offer = offers[offerHash];
+
+        require(offer.status == OfferStatus.CANCELLED, "Offer not cancelled");
+
+        require(offer.cancelHash == offerCancelHash, "Invalid cancel hash");
+
+        emit OfferCancelClaim(offerCancelHash);
+
+        uint256 cryptoAmountToRefund = _getAvailableOfferAmount(offerHash);
+
+        uint256 secretNullifierAmountHash = _poseidonHash(
+            secretNullifierHash,
+            cryptoAmountToRefund
+        );
+        uint256 commitment = _poseidonHash(
+            secretNullifierAmountHash,
+            uint256(uint160(offer.tokenAddress))
+        );
+
+        // Add to merkle tree
+        tree.addLeaf(commitment);
+        emit Deposit(
+            secretNullifierHash,
+            cryptoAmountToRefund,
+            offer.tokenAddress
+        );
+    }
+
+    function timeOutPendingTransactions(uint256 offerHash) external {
+        bytes32[] storage txnIds = offerTransactions[offerHash];
+
+        for (uint256 i = 0; i < txnIds.length; i++) {
+            Transaction storage txn = transactions[txnIds[i]];
+
+            if (
+                txn.status == TransactionStatus.PENDING &&
+                txn.expiresAt < block.timestamp
+            ) {
+                txn.status = TransactionStatus.REJECTED;
+            }
+        }
+    }
+
     // Paymoney transaction Functions
     function createTransaction(
         uint256 offerSecretHash,
@@ -252,11 +325,15 @@ contract PrivacyPool {
 
         // Get offer data
         Offer memory offer = offers[offerSecretHash];
-        require(
-            keccak256(bytes(offer.status)) == keccak256(bytes("CREATED")),
-            "Offer not active"
-        );
+        require(offer.status == OfferStatus.CREATED, "Offer not active");
         require(cryptoAmount <= offer.cryptoAmount, "Amount exceeds offer");
+
+        // Check if enough crypto is available (not locked in pending/completed transactions)
+        uint256 availableAmount = _getAvailableOfferAmount(offerSecretHash);
+        require(
+            cryptoAmount <= availableAmount,
+            "Insufficient available crypto in offer"
+        );
 
         // Generate transaction ID
         bytes32 transactionId = keccak256(
@@ -299,7 +376,7 @@ contract PrivacyPool {
             offerType: offer.offerType,
             currency: offer.currency,
             expiresAt: block.timestamp + 60 minutes,
-            status: "pending",
+            status: TransactionStatus.PENDING,
             randomTitle: title,
             tokenAddress: offer.tokenAddress,
             revTag: offer.revTag,
@@ -309,6 +386,9 @@ contract PrivacyPool {
 
         // Map title to transaction ID for lookup
         titleToTransactionId[title] = transactionId;
+
+        // Track this transaction for the offer
+        offerTransactions[offerSecretHash].push(transactionId);
 
         emit TransactionCreated(
             transactionId,
@@ -363,7 +443,7 @@ contract PrivacyPool {
         }
 
         // Mark transaction as successful
-        txn.status = "success";
+        txn.status = TransactionStatus.SUCCESS;
         emit TransactionVerified(
             transactionId,
             "",
@@ -422,7 +502,7 @@ contract PrivacyPool {
         Transaction storage txn = transactions[transactionId];
         require(txn.timestamp != 0, "Transaction not found");
         require(
-            keccak256(bytes(txn.status)) == keccak256(bytes("pending")),
+            txn.status == TransactionStatus.PENDING,
             "Transaction not pending"
         );
         require(block.timestamp <= txn.expiresAt, "Transaction expired");
@@ -504,7 +584,6 @@ contract PrivacyPool {
         // Formula: cryptoToSend = (fiatTransferred / totalFiatPrice) * totalCryptoAmount
         // Example: If offer is 100 crypto for 1000 fiat, and user sent 500 fiat
         // Then: cryptoToSend = (500 / 1000) * 100 = 50 crypto
-
         uint256 cryptoAmountToSend = (txn.fiatAmount * offer.cryptoAmount) /
             offer.fiatAmount;
 
@@ -633,6 +712,57 @@ contract PrivacyPool {
         return string(revTagBytes);
     }
 
+    function _getAvailableOfferAmount(
+        uint256 offerSecretHash
+    ) internal view returns (uint256) {
+        Offer storage offer = offers[offerSecretHash];
+        uint256 totalUsed = 0;
+
+        // Go through all transactions for this offer
+        bytes32[] storage txnIds = offerTransactions[offerSecretHash];
+
+        for (uint256 i = 0; i < txnIds.length; i++) {
+            Transaction storage txn = transactions[txnIds[i]];
+
+            // Count pending and completed transactions (not cancelled/expired)
+            if (
+                txn.status == TransactionStatus.PENDING ||
+                txn.status == TransactionStatus.SUCCESS
+            ) {
+                totalUsed += txn.cryptoAmount;
+            }
+        }
+
+        if (totalUsed >= offer.cryptoAmount) {
+            return 0;
+        }
+
+        return offer.cryptoAmount - totalUsed;
+    }
+
+    function _checkPendingTransactions(
+        uint256 offerSecretHash
+    ) internal view returns (bool) {
+        // Go through all transactions for this offer
+        bytes32[] storage txnIds = offerTransactions[offerSecretHash];
+
+        for (uint256 i = 0; i < txnIds.length; i++) {
+            Transaction storage txn = transactions[txnIds[i]];
+
+            if (txn.status == TransactionStatus.PENDING) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    function getAvailableOfferAmount(
+        uint256 offerSecretHash
+    ) external view returns (uint256) {
+        return _getAvailableOfferAmount(offerSecretHash);
+    }
+
     // Extract clean price value from Binance API format: "price":"3.62596667"
     // Binance always returns exactly 8 decimal places
     function extractCleanPrice(
@@ -717,16 +847,12 @@ contract PrivacyPool {
         bytes32[] calldata publicInputs
     ) internal view {
         uint256 nullifier_1 = uint256(publicInputs[1]);
-        uint256 nullifier_2 = uint256(publicInputs[5]);
 
-        if (nullifierHashes[nullifier_1] || nullifierHashes[nullifier_2]) {
+        if (nullifierHashes[nullifier_1]) {
             revert NullifierAlreadyUsed();
         }
 
-        if (
-            !tree.isValidRoot(uint256(publicInputs[0])) ||
-            !tree.isValidRoot(uint256(publicInputs[4]))
-        ) {
+        if (!tree.isValidRoot(uint256(publicInputs[0]))) {
             revert InvalidRoot();
         }
     }
@@ -762,11 +888,9 @@ contract PrivacyPool {
     ) internal {
         // Mark nullifiers as used
         nullifierHashes[uint256(publicInputs[1])] = true;
-        nullifierHashes[uint256(publicInputs[5])] = true;
 
         // Add refund commitments to tree
-        tree.addLeaf(uint256(publicInputs[8]));
-        tree.addLeaf(uint256(publicInputs[9]));
+        tree.addLeaf(uint256(publicInputs[4]));
 
         // Store offer
         offers[secretHash] = Offer({
@@ -777,9 +901,10 @@ contract PrivacyPool {
             fiatAmount: fiatAmount,
             tokenAddress: tokenAddress,
             fee: fee,
-            status: "CREATED",
+            status: OfferStatus.CREATED,
             revTag: revTag,
-            timestamp: block.timestamp
+            timestamp: block.timestamp,
+            cancelHash: 0
         });
 
         // Emit event
