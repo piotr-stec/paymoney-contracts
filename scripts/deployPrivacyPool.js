@@ -20,16 +20,38 @@ async function main() {
   await merkleTreeLib.waitForDeployment();
   console.log(`MerkleTreeLib deployed to: ${merkleTreeLib.target}`);
 
-  // Deploy HonkVerifier
+  // Deploy ZKTranscriptLib library for DepositVerifier
+  console.log("Deploying ZKTranscriptLib library for DepositVerifier...");
+  const ZKTranscriptLibDeposit = await hre.ethers.getContractFactory("contracts/DepositVerifier.sol:ZKTranscriptLib");
+  const zkTranscriptLibDeposit = await ZKTranscriptLibDeposit.deploy();
+  await zkTranscriptLibDeposit.waitForDeployment();
+  console.log(`ZKTranscriptLib (Deposit) deployed to: ${zkTranscriptLibDeposit.target}`);
+
+  // Deploy ZKTranscriptLib library for BinanceVerifier
+  console.log("Deploying ZKTranscriptLib library for BinanceVerifier...");
+  const ZKTranscriptLibBinance = await hre.ethers.getContractFactory("contracts/BinanceVerifier.sol:ZKTranscriptLib");
+  const zkTranscriptLibBinance = await ZKTranscriptLibBinance.deploy();
+  await zkTranscriptLibBinance.waitForDeployment();
+  console.log(`ZKTranscriptLib (Binance) deployed to: ${zkTranscriptLibBinance.target}`);
+
+  // Deploy HonkVerifier with library linking
   console.log("Deploying HonkVerifier for withdraw...");
-  const HonkVerifier = await hre.ethers.getContractFactory("HonkVerifier");
+  const HonkVerifier = await hre.ethers.getContractFactory("HonkVerifier", {
+    libraries: {
+      "contracts/DepositVerifier.sol:ZKTranscriptLib": zkTranscriptLibDeposit.target,
+    },
+  });
   const honkVerifier = await HonkVerifier.deploy();
   await honkVerifier.waitForDeployment();
   console.log(`HonkVerifier deployed to: ${honkVerifier.target}`);
 
-  // Deploy HonkVerifierBinance
+  // Deploy HonkVerifierBinance with library linking
   console.log("Deploying HonkVerifierBinance...");
-  const HonkVerifierBinance = await hre.ethers.getContractFactory("HonkVerifierBinance");
+  const HonkVerifierBinance = await hre.ethers.getContractFactory("HonkVerifierBinance", {
+    libraries: {
+      "contracts/BinanceVerifier.sol:ZKTranscriptLib": zkTranscriptLibBinance.target,
+    },
+  });
   const honkVerifierBinance = await HonkVerifierBinance.deploy();
   await honkVerifierBinance.waitForDeployment();
   console.log(`HonkVerifierBinance deployed to: ${honkVerifierBinance.target}`);
@@ -67,7 +89,10 @@ async function main() {
     privacyPool: privacyPool.target,
     merkleTreeLib: merkleTreeLib.target,
     poseidonT3: poseidonT3.target,
+    zkTranscriptLibDeposit: zkTranscriptLibDeposit.target,
+    zkTranscriptLibBinance: zkTranscriptLibBinance.target,
     honkVerifier: honkVerifier.target,
+    honkVerifierBinance: honkVerifierBinance.target,
     owner: owner
   };
 }
@@ -80,7 +105,10 @@ if (require.main === module) {
       console.log("PrivacyPool:", addresses.privacyPool);
       console.log("MerkleTreeLib:", addresses.merkleTreeLib);
       console.log("PoseidonT3:", addresses.poseidonT3);
+      console.log("ZKTranscriptLib (Deposit):", addresses.zkTranscriptLibDeposit);
+      console.log("ZKTranscriptLib (Binance):", addresses.zkTranscriptLibBinance);
       console.log("HonkVerifier:", addresses.honkVerifier);
+      console.log("HonkVerifierBinance:", addresses.honkVerifierBinance);
       console.log("Owner:", addresses.owner);
       process.exit(0);
     })
