@@ -2,6 +2,7 @@
 pragma solidity ^0.8.9;
 
 import "./MerkleTreeLibrary.sol";
+import "./TlsnVerificationLib.sol";
 import "lib/poseidon-solidity/contracts/PoseidonT3.sol";
 
 interface IERC20 {
@@ -71,6 +72,7 @@ interface IVerifier {
 
 contract PrivacyPool {
     using MerkleTreeLib for MerkleTreeLib.Tree;
+    using TlsnVerificationLib for *;
 
     // Storage
     MerkleTreeLib.Tree private tree;
@@ -160,6 +162,13 @@ contract PrivacyPool {
         uint256 amount,
         address token
     ) external {
+        // // Example TLSN verification (mock data)
+        // TlsnVerificationLib.SignatureData memory sig;
+        // TlsnVerificationLib.HeaderVerification memory header;
+        // TlsnVerificationLib.TranscriptCommitment memory transcript;
+
+        // // Verify TLSN proof
+        // TlsnVerificationLib.verify(sig, header, transcript);
         uint256 secretNullifierAmountHash = _poseidonHash(
             secretNullifierHash,
             amount

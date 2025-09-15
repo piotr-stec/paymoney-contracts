@@ -3,13 +3,18 @@ require("dotenv").config();
 
 /** @type import('hardhat/config').HardhatUserConfig */
 module.exports = {
-  defaultNetwork: "localhost",
-  // networks: {
-  //   arb: {
-  //     url: process.env.RPC_URL,
-  //     accounts: [process.env.PRIVATE_KEY],
-  //   },
-  // },
+  networks: {
+    sepolia: {
+      url: "https://eth-sepolia.g.alchemy.com/v2/rNDiYBb9E5C7e3FwLaObfcIQfcLb8IlN",
+      accounts: [""],
+      chainId: 11155111,
+    },
+    localhost: {
+      url: "http://127.0.0.1:8545",
+      accounts: [""],
+      chainId: 31337,
+    },
+  },
   solidity: {
     compilers: [
       {
@@ -22,7 +27,7 @@ module.exports = {
         },
       },
       {
-        version: "0.8.21", 
+        version: "0.8.21",
         settings: {
           optimizer: {
             enabled: true,
