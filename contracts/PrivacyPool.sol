@@ -89,6 +89,7 @@ contract PrivacyPool {
     mapping(bytes32 => Transaction) public transactions; // transactionId => Transaction
     mapping(string => bytes32) public titleToTransactionId; // randomTitle => transactionId
     mapping(uint256 => bytes32[]) public offerTransactions; // offerSecretHash => transactionIds[]
+    uint256[] public activeOffers; // Array of active offer secretHashes for enumeration
 
     // Events
     event Deposit(
@@ -272,6 +273,10 @@ contract PrivacyPool {
         require(offer.status == OfferStatus.CREATED, "Offer not active");
         offer.status = OfferStatus.CANCELLED;
         offer.cancelHash = cancelHash;
+
+        // Remove from active offers array
+        _removeFromActiveOffers(offerSecretHash);
+
         emit OfferCancelIntent(offerSecretHash);
     }
 
@@ -472,6 +477,10 @@ contract PrivacyPool {
         // Add to merkle tree
         tree.addLeaf(commitment);
         emit Deposit(secretNullifierHash, cryptoAmountToSend, txn.tokenAddress);
+
+        if (_getAvailableOfferAmount(txn.offerSecretHash) <= 0) {
+            _removeFromActiveOffers(txn.offerSecretHash);
+        }
     }
 
     function _verifyProofAndFindTransaction(
@@ -772,6 +781,57 @@ contract PrivacyPool {
         return _getAvailableOfferAmount(offerSecretHash);
     }
 
+    function getActiveOffersCount() external view returns (uint256) {
+        return activeOffers.length;
+    }
+
+    function getActiveOffers(
+        uint256 offset,
+        uint256 limit
+    ) external view returns (Offer[] memory) {
+        uint256 totalOffers = activeOffers.length;
+
+        if (offset >= totalOffers) {
+            return new Offer[](0);
+        }
+
+        uint256 end = offset + limit;
+        if (end > totalOffers) {
+            end = totalOffers;
+        }
+
+        uint256 resultLength = end - offset;
+        Offer[] memory result = new Offer[](resultLength);
+
+        for (uint256 i = 0; i < resultLength; i++) {
+            uint256 offerHash = activeOffers[offset + i];
+            result[i] = offers[offerHash];
+        }
+
+        return result;
+    }
+
+    function getAllActiveOffers() external view returns (Offer[] memory) {
+        Offer[] memory result = new Offer[](activeOffers.length);
+
+        for (uint256 i = 0; i < activeOffers.length; i++) {
+            uint256 offerHash = activeOffers[i];
+            result[i] = offers[offerHash];
+        }
+
+        return result;
+    }
+    function _removeFromActiveOffers(uint256 offerSecretHash) internal {
+        for (uint256 i = 0; i < activeOffers.length; i++) {
+            if (activeOffers[i] == offerSecretHash) {
+                // Move the last element to the current position and remove the last element
+                activeOffers[i] = activeOffers[activeOffers.length - 1];
+                activeOffers.pop();
+                break;
+            }
+        }
+    }
+
     // Extract clean price value from Binance API format: "price":"3.62596667"
     // Binance always returns exactly 8 decimal places
     function extractCleanPrice(
@@ -915,6 +975,9 @@ contract PrivacyPool {
             timestamp: block.timestamp,
             cancelHash: 0
         });
+
+        // Add to active offers array
+        activeOffers.push(secretHash);
 
         // Emit event
         emit OfferCreated(
