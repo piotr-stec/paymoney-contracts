@@ -944,6 +944,10 @@ contract PrivacyPool {
         }
     }
 
+    function getCurrentRoot() external view returns (uint256) {
+        return tree.currentRoot;
+    }
+
     function _processOfferCreation(
         bytes32[] calldata publicInputs,
         uint256 secretHash,
