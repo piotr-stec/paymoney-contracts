@@ -163,13 +163,6 @@ contract PrivacyPool {
         uint256 amount,
         address token
     ) external {
-        // // Example TLSN verification (mock data)
-        // TlsnVerificationLib.SignatureData memory sig;
-        // TlsnVerificationLib.HeaderVerification memory header;
-        // TlsnVerificationLib.TranscriptCommitment memory transcript;
-
-        // // Verify TLSN proof
-        // TlsnVerificationLib.verify(sig, header, transcript);
         uint256 secretNullifierAmountHash = _poseidonHash(
             secretNullifierHash,
             amount
@@ -417,29 +410,22 @@ contract PrivacyPool {
     }
 
     function verifyTransaction(
-        bytes calldata proofTransaction,
-        bytes32[] calldata publicInputsTransaction,
         bytes calldata proofPrice,
         bytes32[] calldata publicInputsPrice,
-        address tlsnTransactionVerifier,
-        uint8 amountLength,
-        uint8 revTagLength,
-        uint256 secretNullifierHash
+        uint256 secretNullifierHash,
+        TlsnVerificationLib.SignatureData calldata tlsnSignature,
+        TlsnVerificationLib.HeaderVerification calldata tlsnHeader,
+        TlsnVerificationLib.TranscriptCommitment calldata tlsnTranscript
     ) external {
-        // Step 1: Verify TLSN proof and find transaction ID
-        bytes32 transactionId = _verifyProofAndFindTransaction(
-            proofTransaction,
-            publicInputsTransaction,
-            tlsnTransactionVerifier
-        );
+        // Step 1: Verify TLSN proof using TlsnVerificationLib
+        bool verifiedTlsn = TlsnVerificationLib.verify(tlsnSignature, tlsnHeader, tlsnTranscript);
+        require(verifiedTlsn, "TLSN verification failed");
+
+        // Step 2: Verify standard proof and find transaction ID
+        bytes32 transactionId = _findTransaction(tlsnTranscript);
 
         // // Step 2: Validate transaction and extract data
-        _validateTransactionAndExtractData(
-            publicInputsTransaction,
-            transactionId,
-            amountLength,
-            revTagLength
-        );
+        _validateTransactionAndExtractData(transactionId, tlsnTranscript);
 
         // Step 3: Handle offer type specific processing
         Transaction storage txn = transactions[transactionId];
@@ -483,24 +469,12 @@ contract PrivacyPool {
         }
     }
 
-    function _verifyProofAndFindTransaction(
-        bytes calldata proofTransaction,
-        bytes32[] calldata publicInputsTransaction,
-        address tlsnTransactionVerifier
+    function _findTransaction(
+        TlsnVerificationLib.TranscriptCommitment memory tlsnTranscript
     ) internal view returns (bytes32) {
-        // Verify TLSN proof for transaction
-        if (
-            !IVerifier(tlsnTransactionVerifier).verify(
-                proofTransaction,
-                publicInputsTransaction
-            )
-        ) {
-            revert("Invalid transaction proof");
-        }
-
         // Extract comment and find transaction
-        string memory commentData = _extractCommentFromPublicInputs(
-            publicInputsTransaction
+        string memory commentData = _extractCommentFromTranscript(
+            tlsnTranscript
         );
         bytes32 transactionId = titleToTransactionId[commentData];
         require(
@@ -512,10 +486,8 @@ contract PrivacyPool {
     }
 
     function _validateTransactionAndExtractData(
-        bytes32[] calldata publicInputsTransaction,
         bytes32 transactionId,
-        uint8 amountLength,
-        uint8 revTagLength
+        TlsnVerificationLib.TranscriptCommitment memory tlsnTranscript
     ) internal {
         Transaction storage txn = transactions[transactionId];
         require(txn.timestamp != 0, "Transaction not found");
@@ -526,13 +498,11 @@ contract PrivacyPool {
         require(block.timestamp <= txn.expiresAt, "Transaction expired");
 
         // Extract and validate data
-        uint256 fiatAmountTransferred = _extractFiatAmount(
-            publicInputsTransaction,
-            amountLength
+        uint256 fiatAmountTransferred = _extractAmountFromTranscript(
+            tlsnTranscript
         );
-        string memory extractedRevTag = _extractRevTag(
-            publicInputsTransaction,
-            revTagLength
+        string memory extractedRevTag = _extractUsernameFromTranscript(
+            tlsnTranscript
         );
 
         require(
@@ -623,61 +593,165 @@ contract PrivacyPool {
         return PoseidonT3.hash(inputs);
     }
 
-    function _extractCommentFromPublicInputs(
-        bytes32[] calldata publicInputs
+    function _extractCommentFromTranscript(
+        TlsnVerificationLib.TranscriptCommitment memory transcript
     ) internal pure returns (string memory) {
-        bytes memory commentData = new bytes(23);
+        return _extractJsonField(transcript.data, "comment");
+    }
 
-        // Comment data starts at index 35
-        for (uint256 i = 0; i < 23; i++) {
-            commentData[i] = bytes1(uint8(uint256(publicInputs[35 + i])));
-        }
+    function _extractAmountFromTranscript(
+        TlsnVerificationLib.TranscriptCommitment memory transcript
+    ) internal pure returns (uint256) {
+        string memory amountStr = _extractJsonField(transcript.data, "amount");
+        return _parseUnsignedInt(amountStr);
+    }
 
-        string memory fullComment = string(commentData);
+    function _extractCurrencyFromTranscript(
+        TlsnVerificationLib.TranscriptCommitment memory transcript
+    ) internal pure returns (string memory) {
+        return _extractJsonField(transcript.data, "currency");
+    }
 
-        // Parse JSON format: "comment":"value"
-        bytes memory commentBytes = bytes(fullComment);
-        bytes memory jsonPrefix = bytes('"comment":"');
+    function _extractUsernameFromTranscript(
+        TlsnVerificationLib.TranscriptCommitment memory transcript
+    ) internal pure returns (string memory) {
+        // Username is in nested structure: "recipient":{"username":"value"}
+        return
+            _extractNestedJsonField(transcript.data, "recipient", "username");
+    }
 
-        if (commentBytes.length >= jsonPrefix.length + 1) {
-            // Check if starts with "comment":"
-            bool hasJsonPrefix = true;
-            for (uint256 i = 0; i < jsonPrefix.length; i++) {
-                if (commentBytes[i] != jsonPrefix[i]) {
-                    hasJsonPrefix = false;
+    function _extractJsonField(
+        bytes memory data,
+        string memory fieldName
+    ) internal pure returns (string memory) {
+        bytes memory fieldPattern = abi.encodePacked('"', fieldName, '":"');
+
+        for (uint256 i = 0; i < data.length - fieldPattern.length; i++) {
+            bool found = true;
+            for (uint256 j = 0; j < fieldPattern.length; j++) {
+                if (data[i + j] != fieldPattern[j]) {
+                    found = false;
                     break;
                 }
             }
 
-            if (hasJsonPrefix) {
-                // Find the ending quote
-                uint256 startPos = jsonPrefix.length;
-                uint256 endPos = commentBytes.length;
+            if (found) {
+                uint256 startPos = i + fieldPattern.length;
+                uint256 endPos = startPos;
 
-                // Look for ending quote
-                for (uint256 i = startPos; i < commentBytes.length; i++) {
-                    if (commentBytes[i] == '"') {
-                        endPos = i;
+                // Find closing quote
+                for (uint256 k = startPos; k < data.length; k++) {
+                    if (data[k] == '"') {
+                        endPos = k;
                         break;
                     }
                 }
 
                 if (endPos > startPos) {
-                    // Extract value between quotes
-                    uint256 valueLength = endPos - startPos;
-                    bytes memory valueBytes = new bytes(valueLength);
-
-                    for (uint256 i = 0; i < valueLength; i++) {
-                        valueBytes[i] = commentBytes[startPos + i];
+                    bytes memory result = new bytes(endPos - startPos);
+                    for (uint256 k = 0; k < endPos - startPos; k++) {
+                        result[k] = data[startPos + k];
                     }
-
-                    return string(valueBytes);
+                    return string(result);
                 }
             }
         }
 
-        // If no JSON format found, return original string
-        return fullComment;
+        return "";
+    }
+
+    function _extractNestedJsonField(
+        bytes memory data,
+        string memory parentField,
+        string memory childField
+    ) internal pure returns (string memory) {
+        bytes memory parentPattern = abi.encodePacked('"', parentField, '":{');
+
+        for (uint256 i = 0; i < data.length - parentPattern.length; i++) {
+            bool found = true;
+            for (uint256 j = 0; j < parentPattern.length; j++) {
+                if (data[i + j] != parentPattern[j]) {
+                    found = false;
+                    break;
+                }
+            }
+
+            if (found) {
+                // Found parent object, now search for child field within it
+                uint256 startSearch = i + parentPattern.length;
+                uint256 objectEnd = startSearch;
+                uint256 braceCount = 1;
+
+                // Find the end of the parent object
+                for (
+                    uint256 k = startSearch;
+                    k < data.length && braceCount > 0;
+                    k++
+                ) {
+                    if (data[k] == "{") braceCount++;
+                    else if (data[k] == "}") braceCount--;
+                    objectEnd = k;
+                }
+
+                // Extract the parent object data
+                bytes memory objectData = new bytes(objectEnd - startSearch);
+                for (uint256 k = 0; k < objectEnd - startSearch; k++) {
+                    objectData[k] = data[startSearch + k];
+                }
+
+                // Now extract the child field from this object
+                return _extractJsonField(objectData, childField);
+            }
+        }
+
+        return "";
+    }
+
+    function _parseSignedInt(string memory str) internal pure returns (int256) {
+        bytes memory strBytes = bytes(str);
+        if (strBytes.length == 0) return 0;
+
+        bool negative = false;
+        uint256 startIndex = 0;
+
+        if (strBytes[0] == "-") {
+            negative = true;
+            startIndex = 1;
+        }
+
+        uint256 result = 0;
+        for (uint256 i = startIndex; i < strBytes.length; i++) {
+            uint8 digit = uint8(strBytes[i]);
+            if (digit >= 0x30 && digit <= 0x39) {
+                result = result * 10 + (digit - 0x30);
+            }
+        }
+
+        return negative ? -int256(result) : int256(result);
+    }
+
+    function _parseUnsignedInt(
+        string memory str
+    ) internal pure returns (uint256) {
+        bytes memory strBytes = bytes(str);
+        if (strBytes.length == 0) return 0;
+
+        uint256 startIndex = 0;
+
+        // Skip minus sign if present (convert -2 to 2)
+        if (strBytes[0] == "-") {
+            startIndex = 1;
+        }
+
+        uint256 result = 0;
+        for (uint256 i = startIndex; i < strBytes.length; i++) {
+            uint8 digit = uint8(strBytes[i]);
+            if (digit >= 0x30 && digit <= 0x39) {
+                result = result * 10 + (digit - 0x30);
+            }
+        }
+
+        return result;
     }
 
     function _extractFiatAmount(
