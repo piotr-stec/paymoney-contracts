@@ -20,7 +20,6 @@ struct OfferParams {
     uint256 cryptoAmount;
     uint256 fiatAmount; // 0 for dynamic offers
     address tokenAddress;
-    uint256 fee;
     string revTag;
 }
 
@@ -31,7 +30,9 @@ enum TransactionStatus {
 }
 
 struct Transaction {
-    uint256 cryptoAmount;
+    uint256 cryptoAmount; // Amount user will receive
+    uint256 cryptoAmountWithFee; // Total amount deducted from offer (including fee)
+    uint256 feeAmount; // Fee charged to taker
     uint256 fiatAmount; // 0 for dynamic transactions
     string offerType;
     string currency;
@@ -56,7 +57,6 @@ struct Offer {
     uint256 cryptoAmount;
     uint256 fiatAmount; // 0 for dynamic offers
     address tokenAddress;
-    uint256 fee;
     OfferStatus status;
     string revTag;
     uint256 timestamp;
@@ -79,6 +79,11 @@ contract PrivacyPool {
     mapping(uint256 => bool) public nullifierHashes;
 
     address public owner;
+
+    // Fee system
+    uint256 public constant TAKER_FEE_RATE = 200; // 2% = 200 basis points
+    uint256 public constant BASIS_POINTS = 10000; // 100% = 10000 basis points
+    mapping(address => uint256) public collectedFees; // tokenAddress => total collected fees
 
     // Verifiers
     address public verifier;
@@ -246,7 +251,6 @@ contract PrivacyPool {
             publicInputs,
             params.tokenAddress,
             params.cryptoAmount,
-            params.fee,
             secretHash
         );
 
@@ -262,7 +266,6 @@ contract PrivacyPool {
             params.cryptoAmount,
             params.fiatAmount,
             params.tokenAddress,
-            params.fee,
             params.revTag
         );
     }
@@ -332,7 +335,7 @@ contract PrivacyPool {
     // Paymoney transaction Functions
     function createTransaction(
         uint256 offerSecretHash,
-        uint256 cryptoAmount,
+        uint256 cryptoAmount, // Amount user wants to receive
         string calldata title
     ) external returns (bytes32) {
         require(offers[offerSecretHash].timestamp != 0, "Offer not found");
@@ -340,12 +343,17 @@ contract PrivacyPool {
         // Get offer data
         Offer memory offer = offers[offerSecretHash];
         require(offer.status == OfferStatus.CREATED, "Offer not active");
-        require(cryptoAmount <= offer.cryptoAmount, "Amount exceeds offer");
+
+        // Calculate taker fee using backend formula: amount / (1 - fee_rate)
+        uint256 cryptoAmountWithFee = (cryptoAmount * BASIS_POINTS) / (BASIS_POINTS - TAKER_FEE_RATE);
+        uint256 feeAmount = cryptoAmountWithFee - cryptoAmount;
+
+        require(cryptoAmountWithFee <= offer.cryptoAmount, "Amount exceeds offer");
 
         // Check if enough crypto is available (not locked in pending/completed transactions)
         uint256 availableAmount = _getAvailableOfferAmount(offerSecretHash);
         require(
-            cryptoAmount <= availableAmount,
+            cryptoAmountWithFee <= availableAmount,
             "Insufficient available crypto in offer"
         );
 
@@ -385,7 +393,9 @@ contract PrivacyPool {
 
         // Create transaction
         transactions[transactionId] = Transaction({
-            cryptoAmount: cryptoAmount,
+            cryptoAmount: cryptoAmount, // Amount user will receive
+            cryptoAmountWithFee: cryptoAmountWithFee, // Total deducted from offer
+            feeAmount: feeAmount, // Fee amount
             fiatAmount: fiatAmount,
             offerType: offer.offerType,
             currency: offer.currency,
@@ -455,6 +465,9 @@ contract PrivacyPool {
         } else {
             cryptoAmountToSend = _processStaticOffer(transactionId);
         }
+
+        // Collect fee from transaction
+        collectedFees[txn.tokenAddress] += txn.feeAmount;
 
         // Mark transaction as successful
         txn.status = TransactionStatus.SUCCESS;
@@ -747,7 +760,7 @@ contract PrivacyPool {
                 txn.status == TransactionStatus.PENDING ||
                 txn.status == TransactionStatus.SUCCESS
             ) {
-                totalUsed += txn.cryptoAmount;
+                totalUsed += txn.cryptoAmountWithFee; // Use full amount including fee
             }
         }
 
@@ -930,14 +943,13 @@ contract PrivacyPool {
         bytes32[] calldata publicInputs,
         address tokenAddress,
         uint256 cryptoAmount,
-        uint256 fee,
         uint256 secretHash
     ) internal view {
         address token_address_1 = address(uint160(uint256(publicInputs[2])));
         uint256 amount = uint256(publicInputs[3]);
 
         require(token_address_1 == tokenAddress, "Token address mismatch");
-        require(amount >= cryptoAmount + fee, "Insufficient deposit amount");
+        require(amount >= cryptoAmount, "Insufficient deposit amount");
 
         if (offers[secretHash].timestamp != 0) {
             revert OfferAlreadyExists();
@@ -956,7 +968,6 @@ contract PrivacyPool {
         uint256 cryptoAmount,
         uint256 fiatAmount,
         address tokenAddress,
-        uint256 fee,
         string memory revTag
     ) internal {
         // Mark nullifiers as used
@@ -973,7 +984,6 @@ contract PrivacyPool {
             cryptoAmount: cryptoAmount,
             fiatAmount: fiatAmount,
             tokenAddress: tokenAddress,
-            fee: fee,
             status: OfferStatus.CREATED,
             revTag: revTag,
             timestamp: block.timestamp,
@@ -993,5 +1003,37 @@ contract PrivacyPool {
             tokenAddress,
             revTag
         );
+    }
+
+    // Fee management functions
+    function withdrawFees(address tokenAddress) external {
+        require(msg.sender == owner, "Only owner can withdraw fees");
+
+        uint256 feeAmount = collectedFees[tokenAddress];
+        require(feeAmount > 0, "No fees to withdraw");
+
+        collectedFees[tokenAddress] = 0;
+
+        IERC20 token = IERC20(tokenAddress);
+        require(token.transfer(owner, feeAmount), "Fee transfer failed");
+    }
+
+    function getCollectedFees(address tokenAddress) external view returns (uint256) {
+        return collectedFees[tokenAddress];
+    }
+
+    function getTakerFeeRate() external pure returns (uint256, uint256) {
+        return (TAKER_FEE_RATE, BASIS_POINTS); // Returns rate and basis points for calculation
+    }
+
+    function calculateTakerFee(uint256 cryptoAmount) external pure returns (uint256 totalWithFee, uint256 feeAmount) {
+        totalWithFee = (cryptoAmount * BASIS_POINTS) / (BASIS_POINTS - TAKER_FEE_RATE);
+        feeAmount = totalWithFee - cryptoAmount;
+        return (totalWithFee, feeAmount);
+    }
+
+    function getMaxBuyableAmount(uint256 offerSecretHash) external view returns (uint256) {
+        uint256 availableAmount = _getAvailableOfferAmount(offerSecretHash);
+        return (availableAmount * (BASIS_POINTS - TAKER_FEE_RATE)) / BASIS_POINTS;
     }
 }
