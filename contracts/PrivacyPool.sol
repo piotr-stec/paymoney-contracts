@@ -276,6 +276,17 @@ contract PrivacyPool {
         emit OfferCancelIntent(offerSecretHash);
     }
 
+    function checkIfCloseable(uint256 offerHash) external view returns (bool, uint256) {
+        Offer memory offer = offers[offerHash];
+        if (offer.status != OfferStatus.CANCELLED) {
+            return (false, 0);
+        }
+
+        // Check if there are any pending transactions
+        (bool hasPending, uint256 latestPendingTimestamp) = _checkPendingTransactions(offerHash);
+        return (!hasPending, latestPendingTimestamp);
+    }
+
     function cancelClaim(
         uint256 offerHash,
         uint256 cancelSecret,
@@ -325,6 +336,21 @@ contract PrivacyPool {
         }
     }
 
+    function _timeOutPendingTransactions(uint256 offerHash) internal {
+        bytes32[] storage txnIds = offerTransactions[offerHash];
+
+        for (uint256 i = 0; i < txnIds.length; i++) {
+            Transaction storage txn = transactions[txnIds[i]];
+
+            if (
+                txn.status == TransactionStatus.PENDING &&
+                txn.expiresAt < block.timestamp
+            ) {
+                txn.status = TransactionStatus.REJECTED;
+            }
+        }
+    }
+
     // Paymoney transaction Functions
     function createTransaction(
         uint256 offerSecretHash,
@@ -338,10 +364,14 @@ contract PrivacyPool {
         require(offer.status == OfferStatus.CREATED, "Offer not active");
 
         // Calculate taker fee using backend formula: amount / (1 - fee_rate)
-        uint256 cryptoAmountWithFee = (cryptoAmount * BASIS_POINTS) / (BASIS_POINTS - TAKER_FEE_RATE);
+        uint256 cryptoAmountWithFee = (cryptoAmount * BASIS_POINTS) /
+            (BASIS_POINTS - TAKER_FEE_RATE);
         uint256 feeAmount = cryptoAmountWithFee - cryptoAmount;
 
-        require(cryptoAmountWithFee <= offer.cryptoAmount, "Amount exceeds offer");
+        require(
+            cryptoAmountWithFee <= offer.cryptoAmount,
+            "Amount exceeds offer"
+        );
 
         // Check if enough crypto is available (not locked in pending/completed transactions)
         uint256 availableAmount = _getAvailableOfferAmount(offerSecretHash);
@@ -428,7 +458,11 @@ contract PrivacyPool {
         TlsnVerificationLib.TranscriptCommitment calldata tlsnTranscript
     ) external {
         // Step 1: Verify TLSN proof using TlsnVerificationLib
-        bool verifiedTlsn = TlsnVerificationLib.verify(tlsnSignature, tlsnHeader, tlsnTranscript);
+        bool verifiedTlsn = TlsnVerificationLib.verify(
+            tlsnSignature,
+            tlsnHeader,
+            tlsnTranscript
+        );
         require(verifiedTlsn, "TLSN verification failed");
 
         // Step 2: Verify standard proof and find transaction ID
@@ -831,7 +865,7 @@ contract PrivacyPool {
 
             // Count pending and completed transactions (not cancelled/expired)
             if (
-                txn.status == TransactionStatus.PENDING ||
+                (txn.status == TransactionStatus.PENDING && txn.expiresAt >= block.timestamp) ||
                 txn.status == TransactionStatus.SUCCESS
             ) {
                 totalUsed += txn.cryptoAmountWithFee; // Use full amount including fee
@@ -847,19 +881,26 @@ contract PrivacyPool {
 
     function _checkPendingTransactions(
         uint256 offerSecretHash
-    ) internal view returns (bool) {
+    ) internal view returns (bool, uint256) {
         // Go through all transactions for this offer
         bytes32[] storage txnIds = offerTransactions[offerSecretHash];
+        uint256 latestPendingTimestamp = 0;
+        bool hasPending = false;
 
         for (uint256 i = 0; i < txnIds.length; i++) {
             Transaction storage txn = transactions[txnIds[i]];
 
-            if (txn.status == TransactionStatus.PENDING) {
-                return true;
+            if (
+                (txn.status == TransactionStatus.PENDING && txn.expiresAt >= block.timestamp)
+            ) {
+                hasPending = true;
+                if (txn.timestamp > latestPendingTimestamp) {
+                    latestPendingTimestamp = txn.timestamp;
+                }
             }
         }
 
-        return false;
+        return (hasPending, latestPendingTimestamp);
     }
 
     function getAvailableOfferAmount(
@@ -1092,7 +1133,9 @@ contract PrivacyPool {
         require(token.transfer(owner, feeAmount), "Fee transfer failed");
     }
 
-    function getCollectedFees(address tokenAddress) external view returns (uint256) {
+    function getCollectedFees(
+        address tokenAddress
+    ) external view returns (uint256) {
         return collectedFees[tokenAddress];
     }
 
@@ -1100,14 +1143,21 @@ contract PrivacyPool {
         return (TAKER_FEE_RATE, BASIS_POINTS); // Returns rate and basis points for calculation
     }
 
-    function calculateTakerFee(uint256 cryptoAmount) external pure returns (uint256 totalWithFee, uint256 feeAmount) {
-        totalWithFee = (cryptoAmount * BASIS_POINTS) / (BASIS_POINTS - TAKER_FEE_RATE);
+    function calculateTakerFee(
+        uint256 cryptoAmount
+    ) external pure returns (uint256 totalWithFee, uint256 feeAmount) {
+        totalWithFee =
+            (cryptoAmount * BASIS_POINTS) /
+            (BASIS_POINTS - TAKER_FEE_RATE);
         feeAmount = totalWithFee - cryptoAmount;
         return (totalWithFee, feeAmount);
     }
 
-    function getMaxBuyableAmount(uint256 offerSecretHash) external view returns (uint256) {
+    function getMaxBuyableAmount(
+        uint256 offerSecretHash
+    ) external view returns (uint256) {
         uint256 availableAmount = _getAvailableOfferAmount(offerSecretHash);
-        return (availableAmount * (BASIS_POINTS - TAKER_FEE_RATE)) / BASIS_POINTS;
+        return
+            (availableAmount * (BASIS_POINTS - TAKER_FEE_RATE)) / BASIS_POINTS;
     }
 }
