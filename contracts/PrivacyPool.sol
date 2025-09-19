@@ -276,14 +276,19 @@ contract PrivacyPool {
         emit OfferCancelIntent(offerSecretHash);
     }
 
-    function checkIfCloseable(uint256 offerHash) external view returns (bool, uint256) {
+    function checkIfCloseable(
+        uint256 offerHash
+    ) external view returns (bool, uint256) {
         Offer memory offer = offers[offerHash];
         if (offer.status != OfferStatus.CANCELLED) {
             return (false, 0);
         }
 
         // Check if there are any pending transactions
-        (bool hasPending, uint256 latestPendingTimestamp) = _checkPendingTransactions(offerHash);
+        (
+            bool hasPending,
+            uint256 latestPendingTimestamp
+        ) = _checkPendingTransactions(offerHash);
         return (!hasPending, latestPendingTimestamp);
     }
 
@@ -649,7 +654,7 @@ contract PrivacyPool {
     function _extractAmountFromTranscript(
         TlsnVerificationLib.TranscriptCommitment memory transcript
     ) internal pure returns (uint256) {
-        string memory amountStr = _extractJsonField(transcript.data, "amount");
+        string memory amountStr = _extractJsonNumber(transcript.data, "amount");
         return _parseUnsignedInt(amountStr);
     }
 
@@ -689,6 +694,46 @@ contract PrivacyPool {
                 // Find closing quote
                 for (uint256 k = startPos; k < data.length; k++) {
                     if (data[k] == '"') {
+                        endPos = k;
+                        break;
+                    }
+                }
+
+                if (endPos > startPos) {
+                    bytes memory result = new bytes(endPos - startPos);
+                    for (uint256 k = 0; k < endPos - startPos; k++) {
+                        result[k] = data[startPos + k];
+                    }
+                    return string(result);
+                }
+            }
+        }
+
+        return "";
+    }
+
+    function _extractJsonNumber(
+        bytes memory data,
+        string memory fieldName
+    ) internal pure returns (string memory) {
+        bytes memory fieldPattern = abi.encodePacked('"', fieldName, '":');
+
+        for (uint256 i = 0; i < data.length - fieldPattern.length; i++) {
+            bool found = true;
+            for (uint256 j = 0; j < fieldPattern.length; j++) {
+                if (data[i + j] != fieldPattern[j]) {
+                    found = false;
+                    break;
+                }
+            }
+
+            if (found) {
+                uint256 startPos = i + fieldPattern.length;
+                uint256 endPos = startPos;
+
+                // Find the end of number (comma, space, closing brace, or closing bracket)
+                for (uint256 k = startPos; k < data.length; k++) {
+                    if (data[k] == ',' || data[k] == '}' || data[k] == ']' || data[k] == ' ' || data[k] == '\n' || data[k] == '\r') {
                         endPos = k;
                         break;
                     }
@@ -801,6 +846,7 @@ contract PrivacyPool {
         return result;
     }
 
+
     function _extractFiatAmount(
         bytes32[] calldata publicInputs,
         uint8 amountLength
@@ -829,27 +875,6 @@ contract PrivacyPool {
         return result;
     }
 
-    function _extractRevTag(
-        bytes32[] calldata publicInputs,
-        uint8 revTagLength
-    ) internal pure returns (string memory) {
-        // Username format: "username":"value"
-        // Starts at index 105, extract the value between quotes
-        uint256 startIndex = 105 + 12; // "username":" = 12 characters
-
-        // Calculate actual value length (excluding quotes and JSON formatting)
-        // revTagLength is total length (23), minus "username":"" (13 chars), minus closing quote (1 char) = 9 chars
-        uint256 valueLength = revTagLength - 13; // Remove "username":" and closing "
-
-        bytes memory revTagBytes = new bytes(valueLength);
-        for (uint256 i = 0; i < valueLength; i++) {
-            revTagBytes[i] = bytes1(
-                uint8(uint256(publicInputs[startIndex + i]))
-            );
-        }
-
-        return string(revTagBytes);
-    }
 
     function _getAvailableOfferAmount(
         uint256 offerSecretHash
@@ -865,7 +890,8 @@ contract PrivacyPool {
 
             // Count pending and completed transactions (not cancelled/expired)
             if (
-                (txn.status == TransactionStatus.PENDING && txn.expiresAt >= block.timestamp) ||
+                (txn.status == TransactionStatus.PENDING &&
+                    txn.expiresAt >= block.timestamp) ||
                 txn.status == TransactionStatus.SUCCESS
             ) {
                 totalUsed += txn.cryptoAmountWithFee; // Use full amount including fee
@@ -891,7 +917,8 @@ contract PrivacyPool {
             Transaction storage txn = transactions[txnIds[i]];
 
             if (
-                (txn.status == TransactionStatus.PENDING && txn.expiresAt >= block.timestamp)
+                (txn.status == TransactionStatus.PENDING &&
+                    txn.expiresAt >= block.timestamp)
             ) {
                 hasPending = true;
                 if (txn.timestamp > latestPendingTimestamp) {
