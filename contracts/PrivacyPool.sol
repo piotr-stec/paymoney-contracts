@@ -327,18 +327,7 @@ contract PrivacyPool {
     }
 
     function timeOutPendingTransactions(uint256 offerHash) external {
-        bytes32[] storage txnIds = offerTransactions[offerHash];
-
-        for (uint256 i = 0; i < txnIds.length; i++) {
-            Transaction storage txn = transactions[txnIds[i]];
-
-            if (
-                txn.status == TransactionStatus.PENDING &&
-                txn.expiresAt < block.timestamp
-            ) {
-                txn.status = TransactionStatus.REJECTED;
-            }
-        }
+        _timeOutPendingTransactions(offerHash);
     }
 
     function _timeOutPendingTransactions(uint256 offerHash) internal {
@@ -409,7 +398,7 @@ contract PrivacyPool {
         if (isStaticOffer) {
             require(offer.fiatAmount > 0, "Invalid static offer");
             // Static offer: calculate proportional fiat amount
-            fiatAmount = (offer.fiatAmount * cryptoAmount) / offer.cryptoAmount;
+            fiatAmount = (offer.fiatAmount * cryptoAmountWithFee) / offer.cryptoAmount;
         } else {
             require(
                 keccak256(bytes(offer.offerType)) ==
@@ -498,7 +487,7 @@ contract PrivacyPool {
         txn.status = TransactionStatus.SUCCESS;
         emit TransactionVerified(
             transactionId,
-            "",
+            txn.randomTitle,
             txn.fiatAmount,
             cryptoAmountToSend
         );
@@ -556,14 +545,29 @@ contract PrivacyPool {
         string memory extractedRevTag = _extractUsernameFromTranscript(
             tlsnTranscript
         );
+        string memory extractedCurrency = _extractCurrencyFromTranscript(
+            tlsnTranscript
+        );
 
         require(
             keccak256(bytes(extractedRevTag)) == keccak256(bytes(txn.revTag)),
             "RevTag mismatch"
         );
+        require(
+            keccak256(bytes(extractedCurrency)) == keccak256(bytes(txn.currency)),
+            "Currency mismatch"
+        );
 
-        // Update transaction with actual transferred amount
-        txn.fiatAmount = fiatAmountTransferred;
+        // For static offers, validate exact fiat amount match
+        if (keccak256(bytes(txn.offerType)) == keccak256(bytes("static"))) {
+            require(
+                fiatAmountTransferred == txn.fiatAmount,
+                "Fiat amount must match transaction amount exactly"
+            );
+        } else {
+            // For dynamic offers, update with actual transferred amount
+            txn.fiatAmount = fiatAmountTransferred;
+        }
     }
 
     function _processDynamicOffer(
@@ -620,20 +624,10 @@ contract PrivacyPool {
         require(offer.fiatAmount > 0, "Invalid offer fiat amount");
         require(offer.cryptoAmount > 0, "Invalid offer crypto amount");
 
-        // Calculate proportional crypto amount for static offers
-        // Formula: cryptoToSend = (fiatTransferred / totalFiatPrice) * totalCryptoAmount
-        // Example: If offer is 100 crypto for 1000 fiat, and user sent 500 fiat
-        // Then: cryptoToSend = (500 / 1000) * 100 = 50 crypto
-        uint256 cryptoAmountToSend = (txn.fiatAmount * offer.cryptoAmount) /
-            offer.fiatAmount;
-
-        // Ensure we don't send more crypto than available in the offer
-        require(
-            cryptoAmountToSend <= offer.cryptoAmount,
-            "Exceeds available crypto in offer"
-        );
-
-        return cryptoAmountToSend;
+        // For static offers, user gets exactly what they requested (cryptoAmount)
+        // Fee was already calculated and collected during transaction creation
+        // The fiatAmount validation ensures the correct amount was paid
+        return txn.cryptoAmount;
     }
 
     // Internal Functions
@@ -733,7 +727,14 @@ contract PrivacyPool {
 
                 // Find the end of number (comma, space, closing brace, or closing bracket)
                 for (uint256 k = startPos; k < data.length; k++) {
-                    if (data[k] == ',' || data[k] == '}' || data[k] == ']' || data[k] == ' ' || data[k] == '\n' || data[k] == '\r') {
+                    if (
+                        data[k] == "," ||
+                        data[k] == "}" ||
+                        data[k] == "]" ||
+                        data[k] == " " ||
+                        data[k] == "\n" ||
+                        data[k] == "\r"
+                    ) {
                         endPos = k;
                         break;
                     }
@@ -799,28 +800,6 @@ contract PrivacyPool {
         return "";
     }
 
-    function _parseSignedInt(string memory str) internal pure returns (int256) {
-        bytes memory strBytes = bytes(str);
-        if (strBytes.length == 0) return 0;
-
-        bool negative = false;
-        uint256 startIndex = 0;
-
-        if (strBytes[0] == "-") {
-            negative = true;
-            startIndex = 1;
-        }
-
-        uint256 result = 0;
-        for (uint256 i = startIndex; i < strBytes.length; i++) {
-            uint8 digit = uint8(strBytes[i]);
-            if (digit >= 0x30 && digit <= 0x39) {
-                result = result * 10 + (digit - 0x30);
-            }
-        }
-
-        return negative ? -int256(result) : int256(result);
-    }
 
     function _parseUnsignedInt(
         string memory str
@@ -839,35 +818,6 @@ contract PrivacyPool {
         for (uint256 i = startIndex; i < strBytes.length; i++) {
             uint8 digit = uint8(strBytes[i]);
             if (digit >= 0x30 && digit <= 0x39) {
-                result = result * 10 + (digit - 0x30);
-            }
-        }
-
-        return result;
-    }
-
-
-    function _extractFiatAmount(
-        bytes32[] calldata publicInputs,
-        uint8 amountLength
-    ) internal pure returns (uint256) {
-        // Amount format: "amount":-2
-        // Starts at index 76, extract the numeric value after the minus sign
-        uint256 startIndex = 76 + 10; // "amount":- = 10 characters
-
-        bytes memory amountBytes = new bytes(amountLength);
-        for (uint256 i = 0; i < amountLength; i++) {
-            amountBytes[i] = bytes1(
-                uint8(uint256(publicInputs[startIndex + i]))
-            );
-        }
-
-        // Convert bytes to number
-        uint256 result = 0;
-        for (uint256 i = 0; i < amountLength; i++) {
-            uint8 digit = uint8(amountBytes[i]);
-            if (digit >= 0x30 && digit <= 0x39) {
-                // '0'-'9'
                 result = result * 10 + (digit - 0x30);
             }
         }
@@ -1186,5 +1136,11 @@ contract PrivacyPool {
         uint256 availableAmount = _getAvailableOfferAmount(offerSecretHash);
         return
             (availableAmount * (BASIS_POINTS - TAKER_FEE_RATE)) / BASIS_POINTS;
+    }
+
+    function getTransactionByTitle(string calldata title) external view returns (Transaction memory) {
+        bytes32 transactionId = titleToTransactionId[title];
+        require(transactionId != bytes32(0), "Transaction not found");
+        return transactions[transactionId];
     }
 }
